@@ -25,6 +25,7 @@ class Error(Exception):
 class Skill:
     name: str
     path: Path
+    id: str = ''
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,8 @@ class Preset:
     id: str
     name: str
     skills: tuple[Skill, ...]
+    presets: tuple[tuple[str, str], ...] = ()
+    tags: tuple[str, ...] = ()
 
 
 def resolve_cli(cli):
@@ -45,9 +48,9 @@ def resolve_cli(cli):
     return path
 
 
-def read_cli(cli, *args):
+def read_cli(cli, *args, timeout=30):
     cli = resolve_cli(cli)
-    result = subprocess.run([str(cli), '--json', *args], capture_output=True, text=True, timeout=30)
+    result = subprocess.run([str(cli), '--json', *args], capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         raise Error(f'Skills Manager failed: {result.stderr.strip() or result.stdout.strip()}')
     try:
@@ -68,6 +71,10 @@ def load_preset(cli, selector):
         raise Error(f'Preset must match exactly one name or ID: {selector!r}')
     p = matches[0]
     records = read_cli(cli, 'skills', 'list', '--preset', p['id'])
+    return Preset(str(p['id']), str(p['name']), parse_skills(records))
+
+
+def parse_skills(records):
     if not isinstance(records, list):
         raise Error('Unexpected skill list format')
     skills = []
@@ -87,8 +94,108 @@ def load_preset(cli, selector):
         path = Path(raw_path).resolve(strict=True)
         if not path.is_dir() or not (path / 'SKILL.md').is_file():
             raise Error(f'Skill is missing SKILL.md: {path}')
-        skills.append(Skill(name, path))
-    return Preset(str(p['id']), str(p['name']), tuple(sorted(skills, key=lambda s: s.name)))
+        skill_id = record.get('id', '')
+        if not isinstance(skill_id, str):
+            raise Error(f'Unexpected skill ID: {name}')
+        skills.append(Skill(name, path, skill_id))
+    return tuple(sorted(skills, key=lambda s: s.name))
+
+
+def compose_presets(presets):
+    contributors = sorted({pair for p in presets for pair in
+                           (p.presets or (() if p.tags else ((p.id, p.name),)))})
+    tags = tuple(sorted({tag for p in presets for tag in p.tags}))
+    if len(contributors) == 1 and not tags:
+        return presets[0]
+    skills = {}
+    names = {}
+    ids = {}
+    for preset in sorted(presets, key=lambda p: p.id):
+        for skill in preset.skills:
+            path = skill.path.resolve(strict=True)
+            folded = skill.name.casefold()
+            if folded in names and names[folded] != path:
+                raise Error(f'Skill name collision for {skill.name!r}: {names[folded]} and {path}')
+            names[folded] = path
+            if skill.id and skill.id in ids and ids[skill.id] != (skill.name, path):
+                raise Error(f'Skill ID has inconsistent name or path: {skill.id}')
+            if skill.id:
+                ids[skill.id] = (skill.name, path)
+            previous = skills.get(path)
+            if previous and previous.id and skill.id and previous.id != skill.id:
+                raise Error(f'Distinct skill IDs share a path: {path}')
+            if previous is None or (skill.id and not previous.id):
+                skills[path] = Skill(skill.name, path, skill.id)
+    selectors = [p[0] for p in contributors]
+    identity_data = {'presets': selectors, 'tags': tags} if tags else selectors
+    identity = 'composition:' + json.dumps(identity_data, sort_keys=True, separators=(',', ':'))
+    return Preset(identity, ' + '.join([p[1] for p in contributors] + [f'tag:{tag}' for tag in tags]),
+                  tuple(sorted(skills.values(), key=lambda s: s.name)), tuple(contributors), tags)
+
+
+def load_presets(cli, selectors, tags=()):
+    if not selectors and not tags:
+        raise Error('Select at least one preset or --tag')
+    selections = [load_preset(cli, selector) for selector in selectors]
+    if tags:
+        known_tags = read_cli(cli, 'skills', 'tag', 'list')
+        if not isinstance(known_tags, list) or any(not isinstance(t, str) for t in known_tags):
+            raise Error('Unexpected tag list format')
+        for tag in sorted(set(tags)):
+            if tag not in known_tags:
+                raise Error(f'Unknown tag: {tag!r}')
+            records = read_cli(cli, 'skills', 'list', '--tag', tag)
+            if not isinstance(records, list) or any(not isinstance(r, dict) or
+                    not isinstance(r.get('tags'), list) or
+                    any(not isinstance(t, str) for t in r['tags']) for r in records):
+                raise Error('Unexpected tagged skill list format')
+            skills = parse_skills([r for r in records if tag in r['tags'] and 'archived' not in r['tags']])
+            selections.append(Preset('tag:' + tag, 'tag:' + tag, skills, tags=(tag,)))
+    return compose_presets(selections)
+
+
+def selection_details(preset):
+    return {'presets': [{'id': pid, 'name': name} for pid, name in
+                        (preset.presets or (() if preset.tags else ((preset.id, preset.name),)))],
+            'tags': list(preset.tags), 'skill_count': len(preset.skills)}
+
+
+def save_preset(cli, name, selectors, tags=(), dry_run=False, description=None):
+    existing = read_cli(cli, 'presets', 'list')
+    if not isinstance(existing, list) or any(not isinstance(p, dict) or
+            not isinstance(p.get('name'), str) for p in existing):
+        raise Error('Unexpected preset list format')
+    if any(p['name'] == name for p in existing):
+        raise Error(f'Destination preset already exists: {name!r}')
+    preset = load_presets(cli, selectors, tags)
+    if not preset.skills:
+        raise Error('Cannot save an empty selection')
+    current = read_cli(cli, 'skills', 'list')
+    if not isinstance(current, list) or any(not isinstance(r, dict) for r in current):
+        raise Error('Unexpected skill list format')
+    for skill in preset.skills:
+        matches = [r for r in current if r.get('id') == skill.id]
+        if not skill.id or len(matches) != 1 or parse_skills(matches) != (skill,):
+            raise Error(f'Selected skill ID is missing or changed: {skill.name}')
+    skill_ids = [s.id for s in preset.skills]
+    result = {'name': name, 'description': description, 'dry_run': dry_run,
+              **selection_details(preset),
+              'skills': [{'id': s.id, 'name': s.name} for s in preset.skills]}
+    if not dry_run:
+        create_args = ['presets', 'create', name]
+        if description is not None:
+            create_args += ['--description', description]
+        created = read_cli(cli, *create_args)
+        if not isinstance(created, dict) or not isinstance(created.get('id'), str) or not created['id']:
+            raise Error('Unexpected created preset format; inspect Skills Manager before retrying')
+        result['preset_id'] = created['id']
+        try:
+            read_cli(cli, 'presets', 'add-skill', created['id'], *skill_ids, timeout=180)
+        except (Error, subprocess.TimeoutExpired) as exc:
+            raise Error(f'Preset {name!r} was created with ID {created["id"]}, but membership '
+                        f'completion was not confirmed. Inspect it before retrying: {exc}') from exc
+    print(json.dumps(result, indent=2))
+    return 0
 
 
 def bundle(preset, root):
@@ -119,6 +226,10 @@ def bundle(preset, root):
     profile = 'sm-' + hashlib.sha256(preset.id.encode()).hexdigest()[:16]
     manifest = {'format': 1, 'preset_id': preset.id, 'preset_name': preset.name,
                 'mode': 'additive', 'skills': [{'name': s.name, 'path': str(s.path)} for s in preset.skills]}
+    if preset.presets:
+        manifest['presets'] = [{'id': pid, 'name': name} for pid, name in preset.presets]
+    if preset.tags:
+        manifest['tags'] = list(preset.tags)
     data = json.dumps(manifest, sort_keys=True, indent=2) + '\n'
     digest = hashlib.sha256(data.encode()).hexdigest()[:24]
     destination = root / f'{profile}-{digest}'
@@ -203,13 +314,13 @@ def codex_session(executable, directory, cwd, args, smoke=False):
                         raise Error('Codex app-server socket startup timed out')
                     time.sleep(.05)
                 with unix_connect(str(socket), uri='ws://localhost', open_timeout=10) as client:
-                    rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin', 'version': '0.1.0'},
+                    rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin', 'version': '0.2.0'},
                          'capabilities': {'experimentalApi': True}})
                     client.send(json.dumps({'method': 'initialized'}))
                     rpc(client, 2, 'skills/extraRoots/set', {'extraRoots': [str(directory / 'skills')]})
                 if smoke:
                     with unix_connect(str(socket), uri='ws://localhost', open_timeout=10) as client:
-                        rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin_verify', 'version': '0.1.0'},
+                        rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin_verify', 'version': '0.2.0'},
                              'capabilities': {'experimentalApi': True}})
                         client.send(json.dumps({'method': 'initialized'}))
                         result = rpc(client, 2, 'skills/list', {'cwds': [str(cwd)], 'forceReload': True})
@@ -261,11 +372,19 @@ def main(argv=None):
     commands.add_parser('presets')
     commands.add_parser('doctor')
     sync = commands.add_parser('sync')
-    sync.add_argument('preset')
+    sync.add_argument('preset', nargs='*', help='Exact preset names or IDs')
+    sync.add_argument('--tag', action='append', default=[], help='Exact tag; repeat to select a union')
+    save = commands.add_parser('save', help='Save selection membership as a new official preset')
+    save.add_argument('name')
+    save.add_argument('preset', nargs='*', help='Exact preset names or IDs')
+    save.add_argument('--tag', action='append', default=[], help='Exact tag; repeat to select a union')
+    save.add_argument('--dry-run', action='store_true')
+    save.add_argument('--description')
     for name in ('launch', 'verify'):
         p = commands.add_parser(name)
         p.add_argument('agent', choices=['claude', 'codex'])
-        p.add_argument('preset')
+        p.add_argument('preset', nargs='*', help='Exact preset names or IDs')
+        p.add_argument('--tag', action='append', default=[], help='Exact tag; repeat to select a union')
         p.add_argument('--cwd', type=Path, default=Path.cwd())
         p.add_argument('--mode', choices=['additive', 'exclusive'], default='additive')
         p.add_argument('--executable')
@@ -286,7 +405,10 @@ def main(argv=None):
         return 0
     if getattr(args, 'mode', 'additive') == 'exclusive':
         raise Error('Exclusive skill isolation is unsupported. Use --mode additive. Global, project, and plugin skills remain inherited.')
-    directory = bundle(load_preset(args.cli, args.preset), args.root)
+    if args.command == 'save':
+        return save_preset(args.cli, args.name, args.preset, args.tag, args.dry_run, args.description)
+    preset = load_presets(args.cli, args.preset, args.tag)
+    directory = bundle(preset, args.root)
     if args.command == 'sync':
         print(directory)
         return 0
@@ -303,6 +425,7 @@ def main(argv=None):
     if args.command == 'launch' and args.dry_run:
         print(json.dumps({'agent': args.agent, 'executable': executable, 'cwd': str(cwd), 'bundle': str(directory),
                           'mode': 'additive', 'mechanism': '--plugin-dir' if args.agent == 'claude' else 'private app-server + --remote',
+                          **selection_details(preset),
                           'extra_args': extra, 'inherits': ['user skills', 'project skills', 'installed plugins', 'native auth/config']}, indent=2))
         return 0
     if args.agent == 'claude':
