@@ -18,6 +18,22 @@ python3 -m venv .venv
 
 Use `.venv/bin/sm-plugin` or add the virtual environment's bin directory to your PATH. The commands below assume `sm-plugin` is on PATH.
 
+## AI skill
+
+Install the portable [sm-plugin skill](skills/sm-plugin/SKILL.md) so your AI agent can discover presets and tags, combine selections, prepare or launch a session, and save a reusable preset:
+
+```sh
+npx skills add junjiezhou1122/sm-plugin --skill sm-plugin
+```
+
+The skill is in `skills/sm-plugin/` and can also be imported through Skills Manager using its Git tree URL:
+
+```text
+https://github.com/junjiezhou1122/sm-plugin/tree/main/skills/sm-plugin
+```
+
+Installing the skill adds agent instructions. Install the `sm-plugin` CLI separately using the steps above, then run `sm-plugin doctor`. Try asking your agent to "combine my Research preset with the writing tag and save it as Research + Writing" or "preview a Claude session with my Frontend preset."
+
 ## Use
 
 ```sh
