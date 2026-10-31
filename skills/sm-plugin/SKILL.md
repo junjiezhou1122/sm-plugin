@@ -57,14 +57,15 @@ sm-plugin launch claude "Frontend" --tag "writing" --cwd "/path/to/project" --dr
 
 `sync` prints the generated bundle path. `launch --dry-run` generates the local bundle and prints the resolved launch details without starting the agent. It is not a read-only preview. Neither action changes official presets or deployments.
 
-Loading is additive. Global skills, project skills and installed plugins remain available. Exclusive isolation is unsupported. Bundles keep a membership snapshot, but their symlinks reflect later edits to source skill contents.
+Loading is additive by default. Codex exclusive mode is supported through per-process app-server configuration; Claude remains additive. Bundles keep a membership snapshot, but their symlinks reflect later edits to source skill contents.
 
 ### Launch
 
 ```sh
 sm-plugin launch claude "Frontend" --tag "writing" --cwd "/path/to/project"
 sm-plugin launch claude "Frontend" --cwd "/path/to/project" -- --model opus
-sm-plugin launch codex "Research" --tag "writing" --cwd "/path/to/project"
+sm-plugin launch codex "Research"
+sm-plugin launch codex "Research" --mode exclusive --tag "writing" --cwd "/path/to/project"
 ```
 
 Forward Claude arguments after `--`. Keep the launched session attached; Claude background launch is unsupported. Codex accepts no forwarded arguments. Configure its model and permissions through native settings or its TUI.

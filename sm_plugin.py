@@ -292,12 +292,13 @@ def rpc(client, request_id, method, params):
             return response['result']
 
 
-def codex_session(executable, directory, cwd, args, smoke=False):
+def _codex_skill_paths(executable, cwd):
+    """Read the native skill catalog before starting an exclusive server."""
     try:
         from websockets.sync.client import unix_connect
     except ImportError as exc:
         raise Error('Install sm-plugin and its dependencies with pip install -e . from the project directory') from exc
-    with tempfile.TemporaryDirectory(prefix='sm-codex-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='sm-codex-probe-') as temporary:
         runtime = Path(temporary)
         socket = runtime / 's.sock'
         endpoint = 'unix://' + str(socket)
@@ -309,12 +310,62 @@ def codex_session(executable, directory, cwd, args, smoke=False):
                 while not socket.exists():
                     if server.poll() is not None:
                         log.seek(0)
+                        raise Error('Codex app-server exited during exclusive probe: ' + log.read()[-4000:])
+                    if time.monotonic() > deadline:
+                        raise Error('Codex app-server probe socket startup timed out')
+                    time.sleep(.05)
+                with unix_connect(str(socket), uri='ws://localhost', open_timeout=10) as client:
+                    rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin_probe', 'version': '0.3.0'},
+                         'capabilities': {'experimentalApi': True}})
+                    client.send(json.dumps({'method': 'initialized'}))
+                    result = rpc(client, 2, 'skills/list', {'cwds': [str(cwd)], 'forceReload': True})
+                return [str(Path(skill['path']).resolve())
+                        for entry in result.get('data', []) for skill in entry.get('skills', []) if skill.get('path')]
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
+
+def codex_session(executable, directory, cwd, args, smoke=False, exclusive=False):
+    try:
+        from websockets.sync.client import unix_connect
+    except ImportError as exc:
+        raise Error('Install sm-plugin and its dependencies with pip install -e . from the project directory') from exc
+    config_args = []
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    selected_paths = [str((directory / 'skills' / skill['name'] / 'SKILL.md').resolve())
+                      for skill in manifest['skills']]
+    if exclusive:
+        disabled = _codex_skill_paths(executable, cwd)
+        rules = [{'path': path, 'enabled': False} for path in dict.fromkeys(disabled)]
+        rules.extend({'path': path, 'enabled': True} for path in selected_paths)
+        encoded = '[' + ','.join(
+            '{path=' + json.dumps(rule['path']) + ',enabled=' + ('true' if rule['enabled'] else 'false') + '}'
+            for rule in rules) + ']'
+        config_args = ['-c', 'features.plugins=false', '-c', 'skills.bundled.enabled=false',
+                       '-c', 'skills.config=' + encoded]
+    with tempfile.TemporaryDirectory(prefix='sm-codex-') as temporary:
+        runtime = Path(temporary)
+        socket = runtime / 's.sock'
+        endpoint = 'unix://' + str(socket)
+        with (runtime / 'server.log').open('w+') as log:
+            server = subprocess.Popen([executable, 'app-server', *config_args, '--listen', endpoint], cwd=cwd,
+                                      stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 15
+                while not socket.exists():
+                    if server.poll() is not None:
+                        log.seek(0)
                         raise Error('Codex app-server exited: ' + log.read()[-4000:])
                     if time.monotonic() > deadline:
                         raise Error('Codex app-server socket startup timed out')
                     time.sleep(.05)
                 with unix_connect(str(socket), uri='ws://localhost', open_timeout=10) as client:
-                    rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin', 'version': '0.2.0'},
+                    rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin', 'version': '0.3.0'},
                          'capabilities': {'experimentalApi': True}})
                     client.send(json.dumps({'method': 'initialized'}))
                     rpc(client, 2, 'skills/extraRoots/set', {'extraRoots': [str(directory / 'skills')]})
@@ -329,8 +380,15 @@ def codex_session(executable, directory, cwd, args, smoke=False):
                     missing = [s['name'] for s in manifest['skills'] if str((Path(s['path']) / 'SKILL.md').resolve()) not in found]
                     if missing:
                         raise Error('Codex did not discover enabled preset skills: ' + ', '.join(missing))
+                    found = {str(Path(s['path']).resolve()): s for d in result['data'] for s in d['skills']
+                             if s.get('enabled', True)}
+                    if exclusive:
+                        expected = set(selected_paths)
+                        if set(found) != expected:
+                            raise Error('Codex exclusive skill set mismatch; expected %d skills, found %d' %
+                                        (len(expected), len(found)))
                     print(json.dumps({'agent': 'codex', 'preset_skills_verified': len(manifest['skills']),
-                                      'mode': 'additive', 'model_turns': 0}))
+                                      'mode': 'exclusive' if exclusive else 'additive', 'model_turns': 0}))
                     return 0
                 return subprocess.call([executable, '--remote', endpoint, '--cd', str(cwd), *args], cwd=cwd)
             finally:
@@ -345,7 +403,7 @@ def codex_session(executable, directory, cwd, args, smoke=False):
 def doctor(cli):
     cli = resolve_cli(cli)
     result = {'skills_manager': str(cli), 'preset_count': len(read_cli(cli, 'presets', 'list')),
-              'mode': 'additive', 'exclusive_supported': False, 'agents': {}}
+              'mode': 'additive', 'exclusive_supported': {'codex': True, 'claude': False}, 'agents': {}}
     for agent, required in [('claude', '--plugin-dir'), ('codex', '--remote')]:
         executable = shutil.which(agent)
         if not executable:
@@ -403,8 +461,8 @@ def main(argv=None):
     if args.command == 'presets':
         print(json.dumps(read_cli(args.cli, 'presets', 'list'), indent=2))
         return 0
-    if getattr(args, 'mode', 'additive') == 'exclusive':
-        raise Error('Exclusive skill isolation is unsupported. Use --mode additive. Global, project, and plugin skills remain inherited.')
+    if getattr(args, 'mode', 'additive') == 'exclusive' and args.command in {'launch', 'verify'} and args.agent != 'codex':
+        raise Error('Exclusive mode is currently implemented for Codex only; Claude plugin skills remain additive.')
     if args.command == 'save':
         return save_preset(args.cli, args.name, args.preset, args.tag, args.dry_run, args.description)
     preset = load_presets(args.cli, args.preset, args.tag)
@@ -424,15 +482,18 @@ def main(argv=None):
         raise Error('Background launch is unsupported; keep the child attached to the launcher.')
     if args.command == 'launch' and args.dry_run:
         print(json.dumps({'agent': args.agent, 'executable': executable, 'cwd': str(cwd), 'bundle': str(directory),
-                          'mode': 'additive', 'mechanism': '--plugin-dir' if args.agent == 'claude' else 'private app-server + --remote',
+                          'mode': args.mode, 'mechanism': '--plugin-dir' if args.agent == 'claude' else 'private app-server + --remote',
                           **selection_details(preset),
-                          'extra_args': extra, 'inherits': ['user skills', 'project skills', 'installed plugins', 'native auth/config']}, indent=2))
+                          'extra_args': extra,
+                          'inherits': (['native auth/config'] if args.mode == 'exclusive' else
+                                       ['user skills', 'project skills', 'installed plugins', 'native auth/config'])}, indent=2))
         return 0
     if args.agent == 'claude':
         if args.command == 'verify':
             return subprocess.call([executable, 'plugin', 'validate', '--json', str(directory)], cwd=cwd)
         return subprocess.call([executable, '--plugin-dir', str(directory), *extra], cwd=cwd)
-    return codex_session(executable, directory, cwd, extra, smoke=args.command == 'verify')
+    return codex_session(executable, directory, cwd, extra, smoke=args.command == 'verify',
+                         exclusive=args.mode == 'exclusive')
 
 
 def entrypoint():

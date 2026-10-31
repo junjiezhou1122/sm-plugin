@@ -2,7 +2,7 @@
 
 Generate real skill folders from Skills Manager presets and tags, launch Claude Code or Codex with the selection, or save its membership as a new preset.
 
-**Loading is additive.** Global skills, project skills and installed plugins remain available. This version does not provide exclusive skill isolation. `--mode exclusive` exits with an error.
+**Loading is additive by default.** Codex also supports `--mode exclusive`: it starts a private app-server with plugins and bundled skills disabled, disables the native catalog, injects the selected bundle, and verifies the resulting enabled set. Claude remains additive because its plugin skills cannot be controlled by `skillOverrides`.
 
 ## Install
 
@@ -42,6 +42,7 @@ sm-plugin sync "Frontend"
 sm-plugin launch claude "Frontend" --dry-run
 sm-plugin launch claude "Frontend"
 sm-plugin launch codex "Research"
+sm-plugin launch codex "Research" --mode exclusive
 sm-plugin sync nature deli
 sm-plugin launch claude nature deli --dry-run
 sm-plugin launch claude nature deli
@@ -68,7 +69,7 @@ Pass Claude options after `--`.
 sm-plugin launch claude "Frontend" --cwd /path/to/project -- --model opus
 ```
 
-Codex launch currently rejects forwarded arguments. Configure model and permissions through native settings or the TUI. Claude detached background launch is also refused.
+Codex launch currently rejects forwarded arguments. Configure model and permissions through native settings or the TUI. In exclusive mode, Codex disables installed plugins and bundled skills, disables all skills discovered from the native user/project roots, then re-enables only the selected bundle paths. The launch fails if post-start discovery does not exactly match the bundle. Claude detached background launch is also refused.
 
 ## Generated folders
 
