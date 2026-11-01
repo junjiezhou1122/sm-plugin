@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sm-plugin"
-version = "0.2.0"
-description = "Read Skills Manager presets and launch per-process additive skill bundles"
+version = "0.3.0"
+description = "Read Skills Manager presets and launch per-session agent capability bundles"
 requires-python = ">=3.11"
 dependencies = ["websockets>=14,<17"]
 readme = "README.md"

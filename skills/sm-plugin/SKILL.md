@@ -5,7 +5,7 @@ description: "Use sm-plugin to inspect or combine Skills Manager presets and tag
 
 # sm-plugin
 
-Turn the user's requested presets and tags into an additive skill selection. Inspect the available choices, resolve exact selectors, then prepare, launch or save that selection through the CLI.
+Turn the user's requested presets and tags into a skill selection. Inspect the available choices, resolve exact selectors, then prepare, launch or save that selection through the CLI.
 
 ## 1. Check the tools
 
@@ -57,7 +57,7 @@ sm-plugin launch claude "Frontend" --tag "writing" --cwd "/path/to/project" --dr
 
 `sync` prints the generated bundle path. `launch --dry-run` generates the local bundle and prints the resolved launch details without starting the agent. It is not a read-only preview. Neither action changes official presets or deployments.
 
-Loading is additive by default. Codex exclusive mode is supported through per-process app-server configuration; Claude remains additive. Bundles keep a membership snapshot, but their symlinks reflect later edits to source skill contents.
+Loading is additive by default. Claude capability mode creates temporary session settings, disables known plugins and ordinary skills, loads the selected bundle, and restricts MCP servers. Codex exclusive mode uses per-process app-server configuration. Capability mode keeps authentication, model defaults, `CLAUDE.md`, global hooks, custom agents, and managed policy inherited. Bundles keep a membership snapshot, but their symlinks reflect later edits to source skill contents.
 
 ### Launch
 
@@ -66,9 +66,10 @@ sm-plugin launch claude "Frontend" --tag "writing" --cwd "/path/to/project"
 sm-plugin launch claude "Frontend" --cwd "/path/to/project" -- --model opus
 sm-plugin launch codex "Research"
 sm-plugin launch codex "Research" --mode exclusive --tag "writing" --cwd "/path/to/project"
+sm-plugin launch claude "Research" --mode capability --plugin pstack@pstack-claude --tools Read,Edit --cwd "/path/to/project"
 ```
 
-Forward Claude arguments after `--`. Keep the launched session attached; Claude background launch is unsupported. Codex accepts no forwarded arguments. Configure its model and permissions through native settings or its TUI.
+Forward Claude arguments after `--` in additive mode. Capability mode owns settings, plugin, MCP, and tool flags. Use `--plugin PLUGIN_ID` for an installed plugin, `--plugin-dir PATH` for a local plugin, `--tools VALUE` for a built-in tool allowlist, and `--mcp-config VALUE` for MCP configuration. Capability mode uses strict MCP configuration and an empty server set when no value is supplied. Keep the launched session attached; Claude background launch is unsupported. Codex accepts no forwarded arguments. Configure its model and permissions through native settings or its TUI.
 
 Claude loads the generated plugin with `--plugin-dir`. Codex uses a private app-server and its native TUI. Both preserve native authentication and configuration.
 
@@ -92,9 +93,10 @@ Check the result for the action performed. For a saved preset, inspect its membe
 
 ```sh
 sm-plugin verify claude "Frontend"
+sm-plugin verify claude "Research" --mode capability
 sm-plugin verify codex "Research" --tag "writing" --cwd "/path/to/project"
 ```
 
-Verification generates a bundle but sends no model turns. Claude verification checks plugin structure; it does not prove a model invoked a skill. Codex verification checks enabled skill discovery through its experimental app-server API. Rerun `doctor` after official tool updates.
+Verification generates a bundle but sends no model turns. Claude verification checks plugin structure. Capability verification also builds the temporary settings profile and enumerates installed plugins. It does not prove that a model invoked a skill. Global hooks, custom agents, and managed capabilities remain inherited. Codex verification checks enabled skill discovery through its experimental app-server API. Rerun `doctor` after official tool updates.
 
 Report the resolved presets and tags, skill count, bundle path or saved preset ID, and any unresolved error. Distinguish a prepared command, a launched session and verified discovery.
