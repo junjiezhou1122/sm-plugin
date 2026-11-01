@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import sm_plugin
 from sm_plugin import Error, Preset, Skill, bundle, compose_presets, load_preset, load_presets, main, save_preset
 
 
@@ -292,6 +293,49 @@ class CompanionTests(unittest.TestCase):
             with self.assertRaisesRegex(Error, 'Exclusive'):
                 main(['launch', 'claude', 'Example', '--mode', 'exclusive'])
             read.assert_not_called()
+
+    def test_claude_capability_profile_disables_known_plugins_and_skills(self):
+        project_skill = self.base / '.claude/skills/project-skill'
+        project_skill.mkdir(parents=True)
+        (project_skill / 'SKILL.md').write_text('---\nname: project-skill\ndescription: Test.\n---\n')
+        inventory = {
+            'old@market': {'id': 'old@market', 'installPath': str(self.source)},
+            'selected@market': {'id': 'selected@market', 'installPath': str(self.source)},
+        }
+        with patch('sm_plugin._claude_plugin_inventory', return_value=inventory):
+            profile = sm_plugin._claude_capability_profile('fixture-claude', self.base,
+                                                           ('selected@market',))
+        self.assertTrue(profile['settings']['disableBundledSkills'])
+        self.assertEqual(profile['settings']['enabledPlugins'],
+                         {'old@market': False, 'selected@market': True})
+        self.assertIn('project-skill', profile['settings']['skillOverrides'])
+        self.assertEqual(profile['selected_plugins'], ['selected@market'])
+        self.assertEqual(profile['disabled_plugins'], ['old@market'])
+
+    def test_claude_capability_launch_writes_session_profile_and_scopes_mcp(self):
+        inventory = {'selected@market': {'id': 'selected@market', 'installPath': str(self.source)}}
+        captured = {}
+
+        def launch(command, cwd):
+            captured['command'] = command
+            settings = Path(command[command.index('--settings') + 1])
+            captured['settings'] = json.loads(settings.read_text())
+            return 0
+
+        with patch('sm_plugin.load_preset', return_value=self.preset), \
+                patch('sm_plugin._claude_plugin_inventory', return_value=inventory), \
+                patch('sm_plugin.subprocess.call', side_effect=launch):
+            result = main(['--root', str(self.root), 'launch', 'claude', 'Example',
+                           '--mode', 'capability', '--plugin', 'selected@market',
+                           '--mcp-config', str(self.base / 'mcp.json'), '--tools', 'Read,Edit',
+                           '--cwd', str(self.base), '--executable', 'fixture-claude'])
+        self.assertEqual(result, 0)
+        self.assertTrue(captured['settings']['disableBundledSkills'])
+        self.assertEqual(captured['settings']['enabledPlugins'], {'selected@market': True})
+        self.assertIn('--strict-mcp-config', captured['command'])
+        self.assertIn(str(self.base / 'mcp.json'), captured['command'])
+        self.assertEqual(captured['command'][captured['command'].index('--tools') + 1], 'Read,Edit')
+        self.assertEqual(captured['command'].count('--plugin-dir'), 1)
 
     def test_global_directory_write_refused(self):
         with self.assertRaises(Error):

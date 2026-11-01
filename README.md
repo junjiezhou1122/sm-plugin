@@ -2,7 +2,7 @@
 
 Generate real skill folders from Skills Manager presets and tags, launch Claude Code or Codex with the selection, or save its membership as a new preset.
 
-**Loading is additive.** Global skills, project skills and installed plugins remain available. This version does not provide exclusive skill isolation. `--mode exclusive` exits with an error.
+**Loading is additive by default.** Claude supports `--mode capability`, which creates a temporary session settings file, disables known installed plugins and ordinary skills, loads the selected bundle, and restricts MCP servers when requested. Codex supports `--mode exclusive` for its skill roots. Capability mode keeps authentication, model defaults, `CLAUDE.md`, global hooks, and managed policies inherited.
 
 ## Install
 
@@ -17,6 +17,10 @@ python3 -m venv .venv
 ```
 
 Use `.venv/bin/sm-plugin` or add the virtual environment's bin directory to your PATH. The commands below assume `sm-plugin` is on PATH.
+
+## Capability profiles
+
+The runtime-specific capability design is recorded in [docs/capability-profiles/README.md](docs/capability-profiles/README.md). Read the platform document before adding a new adapter.
 
 ## AI skill
 
@@ -40,8 +44,11 @@ Installing the skill adds agent instructions. Install the `sm-plugin` CLI separa
 sm-plugin presets
 sm-plugin sync "Frontend"
 sm-plugin launch claude "Frontend" --dry-run
+sm-plugin launch claude "Research" --mode capability
+sm-plugin launch claude "Research" --mode capability --plugin pstack@pstack-claude --tools Read,Edit
 sm-plugin launch claude "Frontend"
 sm-plugin launch codex "Research"
+sm-plugin launch codex "Research" --mode exclusive
 sm-plugin sync nature deli
 sm-plugin launch claude nature deli --dry-run
 sm-plugin launch claude nature deli
@@ -62,13 +69,19 @@ Add repeatable `--tag TAG` selectors to `sync`, `launch`, `verify` or `save`. Pr
 
 `save NAME [PRESET ...] [--tag TAG ...]` creates a new official Skills Manager preset with the selected source skill IDs. It validates skill paths, name collisions and current IDs before creation, refuses an existing destination name, and rejects empty selections. `--description` adds an optional description. `--dry-run` is read-only and prints the resolved skill IDs and names without generating a bundle. The saved preset is a membership snapshot; later tag changes do not change it. Saving changes preset membership only and does not deploy skills or change the active preset. If creation succeeds but adding membership fails, inspect the new preset in Skills Manager before retrying.
 
-Pass Claude options after `--`.
+Pass Claude options after `--` in additive mode. Capability mode owns the settings, plugin, MCP, and tool flags. Use its selectors before `--`.
 
 ```sh
 sm-plugin launch claude "Frontend" --cwd /path/to/project -- --model opus
+sm-plugin launch claude "Research" --mode capability --plugin pstack@pstack-claude --tools Read,Edit
+sm-plugin launch claude "Research" --mode capability --mcp-config /path/to/research-mcp.json
 ```
 
-Codex launch currently rejects forwarded arguments. Configure model and permissions through native settings or the TUI. Claude detached background launch is also refused.
+`--plugin PLUGIN_ID` selects an installed Claude plugin by the ID reported by `claude plugin list --json`. Repeat it to select more than one plugin. `--plugin-dir PATH` adds a local plugin directory or zip. `--tools VALUE` sets Claude's built-in tool allowlist. Repeat it or use a comma-separated list. `--mcp-config VALUE` selects MCP configuration files or JSON values. Capability mode passes `--strict-mcp-config`; with no MCP value, it passes an empty server set.
+
+Capability mode disables known installed plugins, bundled skills, and ordinary skills found in the user and project directories for the session. Claude still reads authentication, model defaults, `CLAUDE.md`, global hooks, custom agents, and managed policy. Claude's settings merge rules prevent this mode from clearing those sources. The command reports these inherited sources in dry-run output.
+
+Codex launch currently rejects forwarded arguments. Configure model and permissions through native settings or the TUI. In exclusive mode, Codex disables installed plugins and bundled skills, disables all skills discovered from the native user/project roots, then re-enables only the selected bundle paths. The launch fails if post-start discovery does not exactly match the bundle. Claude detached background launch is also refused.
 
 ## Generated folders
 
@@ -84,9 +97,9 @@ Bundles freeze membership, not skill contents. Updates to library contents remai
 
 ## Agent integration
 
-Claude loads a bundle with `--plugin-dir`. Skill commands use the generated plugin namespace, such as `/sm-<hash>:skill-name`.
+Claude additive mode loads a bundle with `--plugin-dir`. Claude capability mode also writes a temporary settings file and passes selected plugin directories, tool flags, and strict MCP configuration. The temporary file is removed when the process exits. Skill commands use the generated plugin namespace, such as `/sm-<hash>:skill-name`.
 
-Codex starts a private app-server for each launch, registers `skills/extraRoots/set`, then connects its native TUI with `--remote unix://<socket>`. The server stops when the TUI exits. Each server has independent extra skill roots. Native account configuration and session storage remain shared.
+Codex starts a private app-server for each launch, registers `skills/extraRoots/set`, then connects its native TUI with `--remote unix://<socket>`. Exclusive mode disables known native skills and plugins before it registers the selected roots. The server stops when the TUI exits. Native account configuration and session storage remain shared.
 
 The tool preserves native authentication and configuration. It does not copy credentials or change global skill directories.
 
@@ -94,14 +107,15 @@ The tool preserves native authentication and configuration. It does not copy cre
 
 sm-plugin is an independent integration with Skills Manager. It reads presets, skills and tags through the official CLI with `--json`. Only `save` writes to Skills Manager, using official `presets create` and `presets add-skill` commands. It never edits the database directly or modifies the official app, library contents or deployments.
 
-Run `doctor` after official updates to check the CLI bridge and launch flags. Use `verify codex <preset>` to exercise the experimental app-server API. These checks detect some compatibility changes; they do not guarantee compatibility with future releases.
+Run `doctor` after official updates to check the CLI bridge and launch flags. Use `verify claude <preset> --mode capability` to validate the generated Claude plugin and capability profile. Use `verify codex <preset>` to exercise the experimental app-server API. These checks detect some compatibility changes; they do not guarantee compatibility with future releases.
 
-Verified versions are Skills Manager CLI 1.40.3, Claude Code 2.1.292, Codex 0.160.1 and websockets 16.0. Codex's app-server API is experimental.
+Verified in this checkout with Skills Manager CLI 1.40.3, Claude Code 2.1.193, Codex 0.163.0 and websockets 16.0. Codex's app-server API is experimental.
 
 ## Verification
 
 ```sh
 sm-plugin verify claude "Frontend"
+sm-plugin verify claude "Research" --mode capability
 sm-plugin verify codex "Research"
 python3 -m unittest discover -s . -v
 python3 verify_runtime.py
@@ -109,6 +123,6 @@ python3 verify_runtime.py
 
 The test suite covers composition order, shared-path and ID deduplication, exact tags, archived filtering, unknown tags, missing selectors, name collisions, single-preset compatibility, snapshot saving by ID, read-only save previews, existing-name refusal, argument forwarding, idempotent generation, concurrent first generation, retained membership snapshots, malformed records, path traversal and protection of unmanaged files.
 
-Claude verification uses the official plugin validator. It checks package structure and reports that skill symlinks are not followed during validation. Its diagnostic states that runtime loading follows them. This does not prove a model has invoked a skill.
+Claude verification uses the official plugin validator. Capability verification also enumerates installed plugins and builds the temporary settings profile, but it sends no model turns. The validator reports that skill symlinks are not followed during validation. Its diagnostic states that runtime loading follows them.
 
 Codex verification registers the preset roots, reconnects and checks actual enabled skills through `skills/list`. `verify_runtime.py` uses one temporary skill to verify nonempty discovery. Verification sends no model turns. Normal interactive use can incur the agent's usual provider costs.

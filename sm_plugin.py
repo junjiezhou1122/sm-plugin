@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read Skills Manager presets and launch agents with additive session skills."""
+"""Read Skills Manager presets and launch agents with per-session capabilities."""
 import argparse
 import hashlib
 import json
@@ -282,6 +282,153 @@ def verify_bundle(path, data, preset, profile):
         raise Error(f'Bundle plugin identity differs: {path}')
 
 
+def _claude_plugin_inventory(executable, cwd):
+    result = subprocess.run([executable, 'plugin', 'list', '--json'], cwd=cwd,
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise Error('Claude plugin list failed: ' + (result.stderr.strip() or result.stdout.strip()))
+    try:
+        records = json.loads(result.stdout)
+    except ValueError as exc:
+        raise Error('Claude plugin list returned invalid JSON') from exc
+    if not isinstance(records, list):
+        raise Error('Claude plugin list returned an unexpected shape')
+    inventory = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get('id'), str) or not record['id']:
+            raise Error('Claude plugin list returned a malformed record')
+        install_path = record.get('installPath')
+        if install_path is not None and (not isinstance(install_path, str) or not install_path):
+            raise Error(f'Claude plugin has an invalid install path: {record["id"]}')
+        if record['id'] in inventory:
+            raise Error(f'Claude plugin list contains duplicate ID: {record["id"]}')
+        inventory[record['id']] = record
+    return inventory
+
+
+def _claude_skill_name(path):
+    try:
+        text = path.read_text(errors='replace')[:8192]
+    except OSError:
+        return path.parent.name
+    match = re.search(r'^name:\s*["\']?([^"\'\n]+?)["\']?\s*$', text, re.MULTILINE)
+    return match.group(1).strip() if match else path.parent.name
+
+
+def _claude_skill_names(cwd):
+    roots = [Path.home() / '.claude' / 'skills', Path.home() / '.claude' / 'commands']
+    current = cwd.resolve()
+    while True:
+        roots.extend([current / '.claude' / 'skills', current / '.claude' / 'commands'])
+        if current.parent == current:
+            break
+        current = current.parent
+    names = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        pattern = 'SKILL.md' if root.name == 'skills' else '*.md'
+        for path in root.rglob(pattern):
+            if path.is_file():
+                name = _claude_skill_name(path)
+                if isinstance(name, str) and name.strip():
+                    names.add(name)
+    return tuple(sorted(names))
+
+
+def _claude_capability_profile(executable, cwd, selected_plugin_ids=(), inventory=None):
+    if inventory is None:
+        inventory = _claude_plugin_inventory(executable, cwd)
+    selected = set(selected_plugin_ids)
+    unknown = sorted(selected - set(inventory))
+    if unknown:
+        raise Error('Unknown Claude plugin ID: ' + ', '.join(unknown))
+    plugin_ids = sorted(inventory)
+    settings = {
+        'disableBundledSkills': True,
+        'enabledPlugins': {plugin_id: plugin_id in selected for plugin_id in plugin_ids},
+        'skillOverrides': {name: 'off' for name in _claude_skill_names(cwd)},
+    }
+    errors = {plugin_id: record['errors'] for plugin_id, record in inventory.items()
+              if isinstance(record.get('errors'), list) and record['errors']}
+    plugin_mcp_servers = sorted(plugin_id for plugin_id in selected
+                                 if inventory[plugin_id].get('mcpServers'))
+    return {
+        'settings': settings,
+        'known_plugins': plugin_ids,
+        'disabled_plugins': [plugin_id for plugin_id in plugin_ids if plugin_id not in selected],
+        'selected_plugins': sorted(selected),
+        'plugin_mcp_servers': plugin_mcp_servers,
+        'disabled_skills': sorted(settings['skillOverrides']),
+        'plugin_errors': errors,
+        'inherits': ['authentication', 'model defaults', 'CLAUDE.md', 'global hooks',
+                     'managed plugins and policies'],
+    }
+
+
+def _claude_plugin_paths(inventory, selectors, extra_dirs):
+    paths = []
+    for selector in selectors:
+        record = inventory.get(selector)
+        if record is None:
+            raise Error(f'Unknown Claude plugin ID: {selector}')
+        install_path = record.get('installPath')
+        if not isinstance(install_path, str) or not install_path:
+            raise Error(f'Claude plugin has no local install path: {selector}')
+        path = Path(install_path).expanduser()
+        if not path.is_dir() and not path.is_file():
+            raise Error(f'Claude plugin install path is missing: {selector}: {path}')
+        paths.append(path)
+    for raw_path in extra_dirs:
+        path = Path(raw_path).expanduser()
+        if not path.is_dir() and not path.is_file():
+            raise Error(f'Claude plugin directory or zip is missing: {path}')
+        paths.append(path)
+    return paths
+
+
+def _claude_mcp_args(configs, strict):
+    if not configs and not strict:
+        return []
+    values = configs or ['{"mcpServers":{}}']
+    result = []
+    for config in values:
+        result.extend(['--mcp-config', config])
+    result.append('--strict-mcp-config')
+    return result
+
+
+def _claude_tools_args(tools):
+    if not tools:
+        return []
+    values = [item for value in tools for item in value.split(',') if item]
+    if not values:
+        raise Error('--tools requires at least one tool name')
+    return ['--tools', ','.join(values)]
+
+
+def _claude_session_command(executable, directory, profile, plugin_paths, tools, mcp_configs,
+                            strict_mcp, extra, settings_path):
+    command = [executable, '--settings', str(settings_path), '--plugin-dir', str(directory)]
+    command.extend(arg for path in plugin_paths for arg in ('--plugin-dir', str(path)))
+    command.extend(_claude_tools_args(tools))
+    command.extend(_claude_mcp_args(mcp_configs, strict_mcp or profile is not None))
+    command.extend(extra)
+    return command
+
+
+def _claude_validate(executable, directory, cwd):
+    if not Path(executable).is_file():
+        return subprocess.call([executable, 'plugin', 'validate', '--json', str(directory)], cwd=cwd)
+    help_result = subprocess.run([executable, 'plugin', 'validate', '--help'], cwd=cwd,
+                                 capture_output=True, text=True, timeout=15)
+    command = [executable, 'plugin', 'validate']
+    if '--json' in help_result.stdout:
+        command.append('--json')
+    command.append(str(directory))
+    return subprocess.call(command, cwd=cwd)
+
+
 def rpc(client, request_id, method, params):
     client.send(json.dumps({'id': request_id, 'method': method, 'params': params}))
     while True:
@@ -292,12 +439,13 @@ def rpc(client, request_id, method, params):
             return response['result']
 
 
-def codex_session(executable, directory, cwd, args, smoke=False):
+def _codex_skill_paths(executable, cwd):
+    """Read the native skill catalog before starting an exclusive server."""
     try:
         from websockets.sync.client import unix_connect
     except ImportError as exc:
         raise Error('Install sm-plugin and its dependencies with pip install -e . from the project directory') from exc
-    with tempfile.TemporaryDirectory(prefix='sm-codex-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='sm-codex-probe-') as temporary:
         runtime = Path(temporary)
         socket = runtime / 's.sock'
         endpoint = 'unix://' + str(socket)
@@ -309,12 +457,62 @@ def codex_session(executable, directory, cwd, args, smoke=False):
                 while not socket.exists():
                     if server.poll() is not None:
                         log.seek(0)
+                        raise Error('Codex app-server exited during exclusive probe: ' + log.read()[-4000:])
+                    if time.monotonic() > deadline:
+                        raise Error('Codex app-server probe socket startup timed out')
+                    time.sleep(.05)
+                with unix_connect(str(socket), uri='ws://localhost', open_timeout=10) as client:
+                    rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin_probe', 'version': '0.3.0'},
+                         'capabilities': {'experimentalApi': True}})
+                    client.send(json.dumps({'method': 'initialized'}))
+                    result = rpc(client, 2, 'skills/list', {'cwds': [str(cwd)], 'forceReload': True})
+                return [str(Path(skill['path']).resolve())
+                        for entry in result.get('data', []) for skill in entry.get('skills', []) if skill.get('path')]
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+
+
+def codex_session(executable, directory, cwd, args, smoke=False, exclusive=False):
+    try:
+        from websockets.sync.client import unix_connect
+    except ImportError as exc:
+        raise Error('Install sm-plugin and its dependencies with pip install -e . from the project directory') from exc
+    config_args = []
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    selected_paths = [str((directory / 'skills' / skill['name'] / 'SKILL.md').resolve())
+                      for skill in manifest['skills']]
+    if exclusive:
+        disabled = _codex_skill_paths(executable, cwd)
+        rules = [{'path': path, 'enabled': False} for path in dict.fromkeys(disabled)]
+        rules.extend({'path': path, 'enabled': True} for path in selected_paths)
+        encoded = '[' + ','.join(
+            '{path=' + json.dumps(rule['path']) + ',enabled=' + ('true' if rule['enabled'] else 'false') + '}'
+            for rule in rules) + ']'
+        config_args = ['-c', 'features.plugins=false', '-c', 'skills.bundled.enabled=false',
+                       '-c', 'skills.config=' + encoded]
+    with tempfile.TemporaryDirectory(prefix='sm-codex-') as temporary:
+        runtime = Path(temporary)
+        socket = runtime / 's.sock'
+        endpoint = 'unix://' + str(socket)
+        with (runtime / 'server.log').open('w+') as log:
+            server = subprocess.Popen([executable, 'app-server', *config_args, '--listen', endpoint], cwd=cwd,
+                                      stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 15
+                while not socket.exists():
+                    if server.poll() is not None:
+                        log.seek(0)
                         raise Error('Codex app-server exited: ' + log.read()[-4000:])
                     if time.monotonic() > deadline:
                         raise Error('Codex app-server socket startup timed out')
                     time.sleep(.05)
                 with unix_connect(str(socket), uri='ws://localhost', open_timeout=10) as client:
-                    rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin', 'version': '0.2.0'},
+                    rpc(client, 1, 'initialize', {'clientInfo': {'name': 'sm_plugin', 'version': '0.3.0'},
                          'capabilities': {'experimentalApi': True}})
                     client.send(json.dumps({'method': 'initialized'}))
                     rpc(client, 2, 'skills/extraRoots/set', {'extraRoots': [str(directory / 'skills')]})
@@ -329,8 +527,15 @@ def codex_session(executable, directory, cwd, args, smoke=False):
                     missing = [s['name'] for s in manifest['skills'] if str((Path(s['path']) / 'SKILL.md').resolve()) not in found]
                     if missing:
                         raise Error('Codex did not discover enabled preset skills: ' + ', '.join(missing))
+                    found = {str(Path(s['path']).resolve()): s for d in result['data'] for s in d['skills']
+                             if s.get('enabled', True)}
+                    if exclusive:
+                        expected = set(selected_paths)
+                        if set(found) != expected:
+                            raise Error('Codex exclusive skill set mismatch; expected %d skills, found %d' %
+                                        (len(expected), len(found)))
                     print(json.dumps({'agent': 'codex', 'preset_skills_verified': len(manifest['skills']),
-                                      'mode': 'additive', 'model_turns': 0}))
+                                      'mode': 'exclusive' if exclusive else 'additive', 'model_turns': 0}))
                     return 0
                 return subprocess.call([executable, '--remote', endpoint, '--cd', str(cwd), *args], cwd=cwd)
             finally:
@@ -345,7 +550,9 @@ def codex_session(executable, directory, cwd, args, smoke=False):
 def doctor(cli):
     cli = resolve_cli(cli)
     result = {'skills_manager': str(cli), 'preset_count': len(read_cli(cli, 'presets', 'list')),
-              'mode': 'additive', 'exclusive_supported': False, 'agents': {}}
+              'mode': 'additive',
+              'capability_supported': {'codex': True, 'claude': True},
+              'exclusive_supported': {'codex': True, 'claude': False}, 'agents': {}}
     for agent, required in [('claude', '--plugin-dir'), ('codex', '--remote')]:
         executable = shutil.which(agent)
         if not executable:
@@ -355,6 +562,9 @@ def doctor(cli):
         version = subprocess.run([executable, '--version'], capture_output=True, text=True, timeout=15)
         result['agents'][agent] = {'available': True, 'version': version.stdout.strip(),
                                    'launch_flag_supported': required in help_result.stdout}
+        if agent == 'claude':
+            result['capability_supported']['claude'] = all(flag in help_result.stdout for flag in
+                                                           ('--settings', '--plugin-dir', '--mcp-config', '--tools'))
     try:
         import websockets
         result['websockets'] = websockets.__version__
@@ -386,7 +596,12 @@ def main(argv=None):
         p.add_argument('preset', nargs='*', help='Exact preset names or IDs')
         p.add_argument('--tag', action='append', default=[], help='Exact tag; repeat to select a union')
         p.add_argument('--cwd', type=Path, default=Path.cwd())
-        p.add_argument('--mode', choices=['additive', 'exclusive'], default='additive')
+        p.add_argument('--mode', choices=['additive', 'capability', 'exclusive'], default='additive')
+        p.add_argument('--plugin', action='append', default=[], help='Installed Claude plugin ID; repeat to select')
+        p.add_argument('--plugin-dir', action='append', default=[], help='Claude plugin directory or zip; repeat to add')
+        p.add_argument('--mcp-config', action='append', default=[], help='Claude MCP config path or JSON; repeat to select')
+        p.add_argument('--strict-mcp-config', action='store_true')
+        p.add_argument('--tools', action='append', default=[], help='Claude built-in tool allowlist; repeat or comma-separate')
         p.add_argument('--executable')
         if name == 'launch':
             p.add_argument('--dry-run', action='store_true')
@@ -403,8 +618,8 @@ def main(argv=None):
     if args.command == 'presets':
         print(json.dumps(read_cli(args.cli, 'presets', 'list'), indent=2))
         return 0
-    if getattr(args, 'mode', 'additive') == 'exclusive':
-        raise Error('Exclusive skill isolation is unsupported. Use --mode additive. Global, project, and plugin skills remain inherited.')
+    if getattr(args, 'mode', 'additive') == 'exclusive' and args.command in {'launch', 'verify'} and args.agent != 'codex':
+        raise Error('Exclusive mode is implemented for Codex only; use --mode capability for Claude.')
     if args.command == 'save':
         return save_preset(args.cli, args.name, args.preset, args.tag, args.dry_run, args.description)
     preset = load_presets(args.cli, args.preset, args.tag)
@@ -420,19 +635,88 @@ def main(argv=None):
         raise Error(f'{args.agent} is not installed')
     if args.agent == 'codex' and extra:
         raise Error('Codex launch currently accepts no forwarded arguments. Configure model and permissions in the native TUI.')
+    if args.agent == 'codex' and (args.plugin or args.plugin_dir or args.mcp_config or args.strict_mcp_config or args.tools):
+        raise Error('Claude plugin, MCP and tool selectors are only supported with agent claude.')
     if args.agent == 'claude' and any(a.split('=')[0] in {'--bg', '--background'} for a in extra):
         raise Error('Background launch is unsupported; keep the child attached to the launcher.')
+    claude_profile = None
+    claude_plugin_paths = []
+    if args.agent == 'claude' and (args.mode == 'capability' or args.plugin):
+        inventory = _claude_plugin_inventory(executable, cwd)
+        claude_profile = (_claude_capability_profile(executable, cwd, args.plugin, inventory=inventory)
+                          if args.mode == 'capability' else None)
+        claude_plugin_paths = (_claude_plugin_paths({}, (), args.plugin_dir)
+                               if args.mode == 'capability' else
+                               _claude_plugin_paths(inventory, args.plugin, args.plugin_dir))
+        if claude_profile and claude_profile['plugin_errors']:
+            print('sm-plugin: Claude plugin inventory reports errors: ' +
+                  ', '.join(sorted(claude_profile['plugin_errors'])), file=sys.stderr)
+        if claude_profile and claude_profile['plugin_mcp_servers'] and not args.mcp_config:
+            print('sm-plugin: selected Claude plugins declare MCP servers, but capability mode uses an empty strict MCP set; '
+                  'pass --mcp-config to enable them.', file=sys.stderr)
+    elif args.agent == 'claude':
+        claude_plugin_paths = [Path(path).expanduser() for path in args.plugin_dir]
+        for path in claude_plugin_paths:
+            if not path.is_dir() and not path.is_file():
+                raise Error(f'Claude plugin directory or zip is missing: {path}')
+    if args.mode == 'capability':
+        reserved = {'--settings', '--plugin-dir', '--mcp-config', '--strict-mcp-config', '--tools',
+                    '--setting-sources', '--bare', '--disable-slash-commands'}
+        if any(argument.split('=', 1)[0] in reserved for argument in extra):
+            raise Error('Capability mode owns Claude settings, plugin, MCP and tool flags; pass selectors before --.')
     if args.command == 'launch' and args.dry_run:
+        capability = None
+        if claude_profile:
+            capability = {'known_plugins': len(claude_profile['known_plugins']),
+                          'disabled_plugins': len(claude_profile['disabled_plugins']),
+                          'selected_plugins': claude_profile['selected_plugins'],
+                          'disabled_skills': len(claude_profile['disabled_skills']),
+                          'mcp': 'selected' if args.mcp_config else 'empty',
+                          'plugin_mcp_servers': claude_profile['plugin_mcp_servers'],
+                          'tools': [item for value in args.tools for item in value.split(',') if item],
+                          'inherits': claude_profile['inherits'],
+                          'plugin_inventory_errors': sorted(claude_profile['plugin_errors'])}
         print(json.dumps({'agent': args.agent, 'executable': executable, 'cwd': str(cwd), 'bundle': str(directory),
-                          'mode': 'additive', 'mechanism': '--plugin-dir' if args.agent == 'claude' else 'private app-server + --remote',
+                          'mode': args.mode, 'mechanism': '--plugin-dir' if args.agent == 'claude' else 'private app-server + --remote',
                           **selection_details(preset),
-                          'extra_args': extra, 'inherits': ['user skills', 'project skills', 'installed plugins', 'native auth/config']}, indent=2))
+                          'extra_args': extra,
+                          'plugin_dirs': [str(path) for path in claude_plugin_paths],
+                          'capability': capability,
+                          'inherits': (claude_profile['inherits'] if claude_profile else
+                                       (['native auth/config'] if args.mode in {'exclusive', 'capability'} else
+                                        ['user skills', 'project skills', 'installed plugins', 'native auth/config']))}, indent=2))
         return 0
     if args.agent == 'claude':
         if args.command == 'verify':
-            return subprocess.call([executable, 'plugin', 'validate', '--json', str(directory)], cwd=cwd)
-        return subprocess.call([executable, '--plugin-dir', str(directory), *extra], cwd=cwd)
-    return codex_session(executable, directory, cwd, extra, smoke=args.command == 'verify')
+            result = _claude_validate(executable, directory, cwd)
+            if result or not claude_profile:
+                return result
+            print(json.dumps({'agent': 'claude', 'mode': 'capability',
+                              'bundle': str(directory),
+                              'known_plugins': len(claude_profile['known_plugins']),
+                              'disabled_plugins': len(claude_profile['disabled_plugins']),
+                              'disabled_skills': len(claude_profile['disabled_skills']),
+                              'selected_plugins': claude_profile['selected_plugins'],
+                              'mcp': 'selected' if args.mcp_config else 'empty',
+                              'plugin_mcp_servers': claude_profile['plugin_mcp_servers'],
+                              'tools': [item for value in args.tools for item in value.split(',') if item],
+                              'model_turns': 0}, indent=2))
+            return 0
+        if claude_profile:
+            with tempfile.TemporaryDirectory(prefix='sm-claude-capability-') as temporary:
+                settings_path = Path(temporary) / 'settings.json'
+                settings_path.write_text(json.dumps(claude_profile['settings'], indent=2) + '\n')
+                command = _claude_session_command(executable, directory, claude_profile,
+                                                  claude_plugin_paths, args.tools, args.mcp_config,
+                                                  args.strict_mcp_config, extra, settings_path)
+                return subprocess.call(command, cwd=cwd)
+        command = [executable, '--plugin-dir', str(directory)]
+        command.extend(arg for path in claude_plugin_paths for arg in ('--plugin-dir', str(path)))
+        command.extend(_claude_tools_args(args.tools))
+        command.extend(_claude_mcp_args(args.mcp_config, args.strict_mcp_config))
+        return subprocess.call(command + extra, cwd=cwd)
+    return codex_session(executable, directory, cwd, extra, smoke=args.command == 'verify',
+                         exclusive=args.mode in {'exclusive', 'capability'})
 
 
 def entrypoint():
